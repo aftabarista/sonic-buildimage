@@ -27,6 +27,7 @@ swsscommon.RestartWaiter = MagicMock()
 
 test_path = os.path.dirname(os.path.abspath(__file__))
 telemetry_path = os.path.join(test_path, 'telemetry')
+dhcp_relay_path = os.path.join(test_path, 'dhcp_relay')
 modules_path = os.path.dirname(test_path)
 scripts_path = os.path.join(modules_path, 'scripts')
 sys.path.insert(0, modules_path)
@@ -58,6 +59,21 @@ from healthd import HealthDaemon
 mock_supervisorctl_output = """
 snmpd                       RUNNING   pid 67, uptime 1:03:56
 snmp-subagent               EXITED    Oct 19 01:53 AM
+"""
+
+mock_dhcp_relay_supervisorctl_output = """
+dhcp-relay:dhcprelayd        RUNNING   pid 100, uptime 1:00:00
+dhcp-relay:dhcp6relay        RUNNING   pid 101, uptime 1:00:00
+"""
+
+mock_dhcp_relay_supervisorctl_output_dhcp6relay_down = """
+dhcp-relay:dhcprelayd        RUNNING   pid 100, uptime 1:00:00
+dhcp-relay:dhcp6relay        EXITED    Oct 19 01:53 AM
+"""
+
+mock_dhcp_relay_supervisorctl_output_no_group_members = """
+rsyslogd                     RUNNING   pid 50, uptime 0:00:01
+supervisor-proc-exit-listener RUNNING   pid 51, uptime 0:00:01
 """
 device_info.get_platform = MagicMock(return_value='unittest')
 
@@ -178,6 +194,98 @@ def test_service_checker_single_asic(mock_config_db, mock_run, mock_docker_clien
     checker.save_critical_process_cache()
     checker.load_critical_process_cache()
     assert origin_container_critical_processes == checker.container_critical_processes
+
+
+@patch('swsscommon.swsscommon.ConfigDBConnector.connect', MagicMock())
+@patch('health_checker.service_checker.ServiceChecker._get_container_folder', MagicMock(return_value=dhcp_relay_path))
+@patch('sonic_py_common.multi_asic.is_multi_asic', MagicMock(return_value=False))
+@patch('docker.DockerClient')
+@patch('health_checker.utils.run_command')
+@patch('swsscommon.swsscommon.ConfigDBConnector')
+def test_service_checker_group_expansion(mock_config_db, mock_run, mock_docker_client):
+    """Verify that group: entries in critical_processes are expanded to individual processes."""
+    setup()
+    mock_db_data = MagicMock()
+    mock_get_table = MagicMock()
+    mock_db_data.get_table = mock_get_table
+    mock_config_db.return_value = mock_db_data
+    mock_get_table.return_value = {
+        'dhcp_relay': {
+            'state': 'enabled',
+            'has_global_scope': 'True',
+            'has_per_asic_scope': 'False',
+        }
+    }
+    mock_containers = MagicMock()
+    mock_dhcp_relay_container = MagicMock()
+    mock_dhcp_relay_container.name = 'dhcp_relay'
+    mock_dhcp_relay_container.labels = {}
+    mock_containers.list = MagicMock(return_value=[mock_dhcp_relay_container])
+    mock_docker_client_object = MagicMock()
+    mock_docker_client.return_value = mock_docker_client_object
+    mock_docker_client_object.containers = mock_containers
+
+    # Both processes running: expect STATUS_OK for each
+    mock_run.return_value = mock_dhcp_relay_supervisorctl_output
+    checker = ServiceChecker()
+    config = Config()
+    checker.check(config)
+
+    assert 'dhcp_relay:dhcp-relay:dhcprelayd' in checker._info
+    assert checker._info['dhcp_relay:dhcp-relay:dhcprelayd'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_OK
+    assert 'dhcp_relay:dhcp-relay:dhcp6relay' in checker._info
+    assert checker._info['dhcp_relay:dhcp-relay:dhcp6relay'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_OK
+
+    # dhcp6relay exits: expect STATUS_NOT_OK for it
+    setup()
+    mock_run.return_value = mock_dhcp_relay_supervisorctl_output_dhcp6relay_down
+    checker = ServiceChecker()
+    checker.check(config)
+
+    assert 'dhcp_relay:dhcp-relay:dhcprelayd' in checker._info
+    assert checker._info['dhcp_relay:dhcp-relay:dhcprelayd'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_OK
+    assert 'dhcp_relay:dhcp-relay:dhcp6relay' in checker._info
+    assert checker._info['dhcp_relay:dhcp-relay:dhcp6relay'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
+
+
+@patch('swsscommon.swsscommon.ConfigDBConnector.connect', MagicMock())
+@patch('health_checker.service_checker.ServiceChecker._get_container_folder', MagicMock(return_value=dhcp_relay_path))
+@patch('sonic_py_common.multi_asic.is_multi_asic', MagicMock(return_value=False))
+@patch('docker.DockerClient')
+@patch('health_checker.utils.run_command')
+def test_service_checker_group_expansion_retries_on_empty(mock_run, mock_docker_client):
+    """If group expansion produces no members (e.g. supervisord still booting),
+    fill_critical_process_by_container must not cache the empty result, so the
+    next check cycle retries instead of latching the gap for the daemon lifetime."""
+    setup()
+    mock_containers = MagicMock()
+    mock_dhcp_relay_container = MagicMock()
+    mock_dhcp_relay_container.name = 'dhcp_relay'
+    mock_dhcp_relay_container.labels = {}
+    mock_containers.list = MagicMock(return_value=[mock_dhcp_relay_container])
+    mock_docker_client_object = MagicMock()
+    mock_docker_client.return_value = mock_docker_client_object
+    mock_docker_client_object.containers = mock_containers
+
+    checker = ServiceChecker()
+
+    # First fill: supervisorctl returns no group members (group still booting).
+    mock_run.return_value = mock_dhcp_relay_supervisorctl_output_no_group_members
+    checker.fill_critical_process_by_container('dhcp_relay')
+    assert 'dhcp_relay' not in checker.container_critical_processes
+
+    # docker exec failure (None) should also leave the container uncached.
+    mock_run.return_value = None
+    checker.fill_critical_process_by_container('dhcp_relay')
+    assert 'dhcp_relay' not in checker.container_critical_processes
+
+    # Subsequent fill once group members are up succeeds and caches all members.
+    mock_run.return_value = mock_dhcp_relay_supervisorctl_output
+    checker.fill_critical_process_by_container('dhcp_relay')
+    assert checker.container_critical_processes['dhcp_relay'] == [
+        'dhcp-relay:dhcprelayd',
+        'dhcp-relay:dhcp6relay',
+    ]
 
 
 @patch('swsscommon.swsscommon.ConfigDBConnector.connect', MagicMock())
@@ -752,6 +860,134 @@ def test_hardware_checker():
     assert checker._info['PDB 3'][HealthChecker.INFO_FIELD_OBJECT_TYPE] == 'PSU'
     assert checker._info['PDB 3'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
     assert 'missing' in checker._info['PDB 3'][HealthChecker.INFO_FIELD_OBJECT_MSG].lower()
+
+
+def test_hardware_checker_liquid_cooling_leak_reported_every_cycle():
+    """A sensor that keeps leaking is Not OK in every check, while the events are sent once per change."""
+    leak_info = {
+        'LIQUID_COOLING_INFO|liquid_cooling_1': {'leak_status': 'Yes', 'leak_sensor_name': 'liquid_cooling_1'},
+        'LIQUID_COOLING_INFO|liquid_cooling_2': {'leak_status': 'No', 'leak_sensor_name': 'liquid_cooling_2'},
+    }
+    MockConnector.data.clear()
+    MockConnector.data.update(copy.deepcopy(leak_info))
+
+    checker = HardwareChecker()
+    config = Config()
+    config.include_devices = ['liquid_cooling']
+
+    def published(mock_publish):
+        return [c for c in mock_publish.call_args_list if c[0][0]]
+
+    with patch.object(HardwareChecker, 'publish_events') as mock_publish:
+        # The leak is held for several cycles: Not OK every time, leak event only in the first one
+        for _ in range(3):
+            checker.check(config)
+            assert 'liquid_cooling_1' in checker._info
+            assert checker._info['liquid_cooling_1'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
+            assert checker._info['liquid_cooling_1'][HealthChecker.INFO_FIELD_OBJECT_MSG] == 'Leakage sensor liquid_cooling_1 is leaking'
+            assert checker._info['liquid_cooling_2'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_OK
+        assert published(mock_publish) == [call(['liquid_cooling_1'], 'sensor report leaking event')]
+
+        # The leak clears: OK again, recovered event sent exactly once
+        mock_publish.reset_mock()
+        MockConnector.data['LIQUID_COOLING_INFO|liquid_cooling_1']['leak_status'] = 'No'
+        for _ in range(2):
+            checker.check(config)
+            assert checker._info['liquid_cooling_1'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_OK
+        assert published(mock_publish) == [call(['liquid_cooling_1'], 'leaking sensor report recovered')]
+
+        # The sensor leaks again: Not OK and a new leak event
+        mock_publish.reset_mock()
+        MockConnector.data['LIQUID_COOLING_INFO|liquid_cooling_1']['leak_status'] = 'Yes'
+        for _ in range(2):
+            checker.check(config)
+            assert checker._info['liquid_cooling_1'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
+        assert published(mock_publish) == [call(['liquid_cooling_1'], 'sensor report leaking event')]
+
+
+def test_hardware_checker_liquid_cooling_leak_through_faulty_sensor():
+    """A leak that passes through N/A sends no second leak event, and the later No sends the recovered event."""
+    MockConnector.data.clear()
+    MockConnector.data.update({'LIQUID_COOLING_INFO|liquid_cooling_1': {'leak_status': 'Yes'}})
+    sensor = MockConnector.data['LIQUID_COOLING_INFO|liquid_cooling_1']
+
+    checker = HardwareChecker()
+    config = Config()
+    config.include_devices = ['liquid_cooling']
+
+    with patch.object(HardwareChecker, 'publish_events') as mock_publish:
+        for leak_status in ['Yes', 'N/A', 'Yes', 'N/A', 'No']:
+            sensor['leak_status'] = leak_status
+            checker.check(config)
+            expected = HealthChecker.STATUS_OK if leak_status == 'No' else HealthChecker.STATUS_NOT_OK
+            assert checker._info['liquid_cooling_1'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == expected
+        assert [c for c in mock_publish.call_args_list if c[0][0]] == [
+            call(['liquid_cooling_1'], 'sensor report leaking event'),
+            call(['liquid_cooling_1'], 'leaking sensor report recovered'),
+        ]
+
+
+def test_hardware_checker_liquid_cooling_two_sensors_leaking():
+    """Two sensors leaking together are both Not OK in every check, and each change sends one event."""
+    MockConnector.data.clear()
+    MockConnector.data.update({
+        'LIQUID_COOLING_INFO|liquid_cooling_1': {'leak_status': 'Yes'},
+        'LIQUID_COOLING_INFO|liquid_cooling_2': {'leak_status': 'Yes'},
+    })
+
+    checker = HardwareChecker()
+    config = Config()
+    config.include_devices = ['liquid_cooling']
+
+    with patch.object(HardwareChecker, 'publish_events') as mock_publish:
+        for _ in range(3):
+            checker.check(config)
+            for name in ['liquid_cooling_1', 'liquid_cooling_2']:
+                assert checker._info[name][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
+        assert [c for c in mock_publish.call_args_list if c[0][0]] == [
+            call(['liquid_cooling_1', 'liquid_cooling_2'], 'sensor report leaking event'),
+        ]
+
+        mock_publish.reset_mock()
+        MockConnector.data['LIQUID_COOLING_INFO|liquid_cooling_1']['leak_status'] = 'No'
+        checker.check(config)
+        assert checker._info['liquid_cooling_1'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_OK
+        assert checker._info['liquid_cooling_2'][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
+        assert [c for c in mock_publish.call_args_list if c[0][0]] == [
+            call(['liquid_cooling_1'], 'leaking sensor report recovered'),
+        ]
+
+
+def test_hardware_checker_liquid_cooling_unexpected_status():
+    """A leak status other than Yes, No or N/A is reported Not OK instead of being skipped."""
+    MockConnector.data.clear()
+    MockConnector.data.update({
+        'LIQUID_COOLING_INFO|liquid_cooling_1': {'leak_status': 'Unknown'},
+        'LIQUID_COOLING_INFO|liquid_cooling_2': {'leak_status': ''},
+    })
+
+    checker = HardwareChecker()
+    config = Config()
+    config.include_devices = ['liquid_cooling']
+    checker.check(config)
+    for name in ['liquid_cooling_1', 'liquid_cooling_2']:
+        assert checker._info[name][HealthChecker.INFO_FIELD_OBJECT_STATUS] == HealthChecker.STATUS_NOT_OK
+
+
+def test_hardware_checker_liquid_cooling_reads_leaking_field():
+    """The checker reads 'leaking' and falls back to the 'leak_status' alias."""
+    MockConnector.data.clear()
+    MockConnector.data.update({
+        'LIQUID_COOLING_INFO|liquid_cooling_1': {'leaking': 'Yes'},
+        'LIQUID_COOLING_INFO|liquid_cooling_2': {'leak_status': 'Yes'},
+    })
+
+    checker = HardwareChecker()
+    config = Config()
+    config.include_devices = ['liquid_cooling']
+    checker.check(config)
+    for name in ['liquid_cooling_1', 'liquid_cooling_2']:
+        assert checker._info[name][HealthChecker.INFO_FIELD_OBJECT_MSG] == 'Leakage sensor {} is leaking'.format(name)
 
 
 def test_hardware_checker_pdb_ignore():

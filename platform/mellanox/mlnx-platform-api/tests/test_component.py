@@ -216,9 +216,10 @@ class TestComponent:
     @mock.patch('sonic_platform.component.subprocess.check_call')
     @mock.patch('sonic_platform.component.MPFAManager.get_path')
     @mock.patch('sonic_platform.component.MPFAManager.get_metadata')
-    @mock.patch('sonic_platform.component.device_info.get_bmc_data', return_value=None)
+    @mock.patch('sonic_platform.device_data.DeviceDataManager.is_platform_with_bmc',
+                mock.MagicMock(return_value=False))
     @mock.patch('sonic_platform.component.os.path.exists')
-    def test_cpld_component(self, mock_exists, mock_get_bmc, mock_get_meta_data, mock_get_path, mock_check_call, mock_mst_context, mock_is_spc1):
+    def test_cpld_component(self, mock_exists, mock_get_meta_data, mock_get_path, mock_check_call, mock_mst_context, mock_is_spc1):
         mock_mst_cm = mock.MagicMock()
         mock_mst_cm.__enter__ = mock.MagicMock(return_value=None)
         mock_mst_cm.__exit__ = mock.MagicMock(return_value=False)
@@ -301,12 +302,13 @@ class TestComponent:
         assert c.auto_update_firmware('', 'cold') == FW_AUTO_SCHEDULED
 
     @mock.patch('sonic_platform.component.utils.write_file')
-    @mock.patch('sonic_platform.component.device_info.get_bmc_data', return_value={'bmc_addr': 'x'})
+    @mock.patch('sonic_platform.device_data.DeviceDataManager.is_platform_with_bmc',
+                mock.MagicMock(return_value=True))
     @mock.patch('sonic_platform.component.MPFAManager.cleanup', mock.MagicMock())
     @mock.patch('sonic_platform.component.MPFAManager.extract', mock.MagicMock())
     @mock.patch('sonic_platform.component.MPFAManager.get_path')
     @mock.patch('sonic_platform.component.MPFAManager.get_metadata')
-    def test_cpld_update_firmware_bmc_mpfa_triggers_aux_power_cycle(self, mock_get_meta_data, mock_get_path, mock_get_bmc, mock_write):
+    def test_cpld_update_firmware_bmc_mpfa_triggers_aux_power_cycle(self, mock_get_meta_data, mock_get_path, mock_write):
         c = ComponentCPLD(1)
         c._install_firmware = mock.MagicMock(return_value=True)
         mock_meta_data = mock.MagicMock()
@@ -321,12 +323,13 @@ class TestComponent:
         mock_write.assert_called_once_with(ComponentCPLD.AUX_PWR_CYCLE_FILE, '1', raise_exception=True)
 
     @mock.patch('sonic_platform.component.utils.write_file')
-    @mock.patch('sonic_platform.component.device_info.get_bmc_data', return_value={'bmc_addr': 'x'})
+    @mock.patch('sonic_platform.device_data.DeviceDataManager.is_platform_with_bmc',
+                mock.MagicMock(return_value=True))
     @mock.patch('sonic_platform.component.MPFAManager.cleanup', mock.MagicMock())
     @mock.patch('sonic_platform.component.MPFAManager.extract', mock.MagicMock())
     @mock.patch('sonic_platform.component.MPFAManager.get_path')
     @mock.patch('sonic_platform.component.MPFAManager.get_metadata')
-    def test_cpld_update_firmware_bmc_mpfa_burn_fail_skips_aux_power_cycle(self, mock_get_meta_data, mock_get_path, mock_get_bmc, mock_write):
+    def test_cpld_update_firmware_bmc_mpfa_burn_fail_skips_aux_power_cycle(self, mock_get_meta_data, mock_get_path, mock_write):
         c = ComponentCPLD(1)
         c._install_firmware = mock.MagicMock(return_value=False)
         mock_meta_data = mock.MagicMock()
@@ -558,7 +561,9 @@ class TestComponent:
         o._ONIEUpdater__trigger_update = mock.MagicMock()
         o._ONIEUpdater__is_update_staged = mock.MagicMock()
         o._ONIEUpdater__unstage_update = mock.MagicMock()
+        o._ONIEUpdater__clear_pending_updates = mock.MagicMock()
         o.update_firmware('')
+        o._ONIEUpdater__clear_pending_updates.assert_called_once()
         o._ONIEUpdater__stage_update.assert_called_once()
         o._ONIEUpdater__trigger_update.assert_called_once()
         o._ONIEUpdater__is_update_staged.assert_not_called()
@@ -572,6 +577,60 @@ class TestComponent:
         with pytest.raises(RuntimeError):
             o.update_firmware('')
             o._ONIEUpdater__unstage_update.assert_called_once()
+
+    def test_onie_updater_update_firmware_clear_pending_aborts(self):
+        # A failure clearing stale pending updates must abort before staging,
+        # so a poisoned pending dir cannot trigger the ONIE update-mode hang.
+        o = ONIEUpdater()
+        o._ONIEUpdater__clear_pending_updates = mock.MagicMock(side_effect=RuntimeError(''))
+        o._ONIEUpdater__stage_update = mock.MagicMock()
+        o._ONIEUpdater__trigger_update = mock.MagicMock()
+        o._ONIEUpdater__is_update_staged = mock.MagicMock(return_value=False)
+        o._ONIEUpdater__unstage_update = mock.MagicMock()
+        with pytest.raises(RuntimeError):
+            o.update_firmware('')
+        o._ONIEUpdater__stage_update.assert_not_called()
+        o._ONIEUpdater__trigger_update.assert_not_called()
+        o._ONIEUpdater__unstage_update.assert_not_called()
+
+        # Batched path (allow_reboot=False) must NOT clear pending.
+        o._ONIEUpdater__clear_pending_updates = mock.MagicMock()
+        o._ONIEUpdater__stage_update = mock.MagicMock()
+        o._ONIEUpdater__trigger_update = mock.MagicMock()
+        o.update_firmware('', allow_reboot=False)
+        o._ONIEUpdater__clear_pending_updates.assert_not_called()
+        o._ONIEUpdater__stage_update.assert_called_once()
+
+    @mock.patch('sonic_platform.component.subprocess.check_call')
+    @mock.patch('sonic_platform.component.subprocess.check_output')
+    def test_onie_updater_clear_pending_updates(self, mock_check_output, mock_check_call):
+        o = ONIEUpdater()
+        header = ("** Pending firmware update information:\n"
+                  "Name               | Version / Type | Attempts |Size (Bytes)  | Date\n"
+                  "===================+================+==========+==============+====\n")
+        # Empty pending -> nothing removed.
+        mock_check_output.return_value = \
+            "** Pending firmware update information:\nNo pending firmware updates present."
+        o._ONIEUpdater__clear_pending_updates()
+        mock_check_call.assert_not_called()
+
+        # Two stale entries (incl. a non-firmware sidecar) -> both removed.
+        mock_check_output.return_value = header + \
+            "0ACTV.metainfo.xml | unknown     | 0 | 11       | d\n" + \
+            "0ACTV.rom          | bios_update | 0 | 16777216 | d\n"
+        o._ONIEUpdater__clear_pending_updates()
+        assert mock_check_call.call_count == 2
+
+        # A removal failure must abort (raise), not silently proceed.
+        mock_check_call.side_effect = subprocess.CalledProcessError(1, None)
+        with pytest.raises(RuntimeError):
+            o._ONIEUpdater__clear_pending_updates()
+
+        # A listing failure must abort (raise) too.
+        mock_check_call.side_effect = None
+        mock_check_output.side_effect = subprocess.CalledProcessError(1, None)
+        with pytest.raises(RuntimeError):
+            o._ONIEUpdater__clear_pending_updates()
 
     @mock.patch('sonic_platform.component.os.path.lexists')
     @mock.patch('sonic_platform.component.os.path.exists', mock.MagicMock(return_value=False))

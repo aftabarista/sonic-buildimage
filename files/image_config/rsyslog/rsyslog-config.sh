@@ -68,6 +68,12 @@ if [ ! -f /etc/rsyslog.conf ] || ! cmp -s "$TMPFILE" /etc/rsyslog.conf; then
         exit 1
     fi
 else
-    # Config unchanged — just signal rsyslog to re-open log files
-    systemctl kill -s HUP rsyslog
+    if [[ ($NUM_ASIC -gt 1) || -n "$docker0_ip" ]]; then
+        # docker0 may not be present when rsyslog.service starts. Restart
+        # whenever the generated configuration binds a docker0 socket.
+        systemctl restart rsyslog
+    else
+        # Config unchanged — just signal rsyslog to re-open log files
+        systemctl kill -s HUP rsyslog
+    fi
 fi

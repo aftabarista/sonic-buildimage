@@ -187,7 +187,6 @@ RUN apt-get update && apt-get install -y eatmydata && eatmydata apt-get install 
         python3-all-dev \
 #{%- endif %}
         python3-twisted \
-        phpunit \
         libbit-vector-perl \
         openjdk-11-jdk \
         javahelper \
@@ -196,7 +195,6 @@ RUN apt-get update && apt-get install -y eatmydata && eatmydata apt-get install 
         libhttpclient-java \
         libslf4j-java \
         libservlet3.1-java \
-        pkg-php-tools \
 # For mellanox sdk build
         libpcre3 \
         libpcre3-dev \
@@ -557,9 +555,17 @@ RUN patch -p1 -i /disable-non-manylinux.patch /usr/local/lib/python3.9/dist-pack
 RUN pip3 install fastentrypoints mock
 
 # For building sonic_ycabled
+{%- if CONFIGURED_ARCH == "armhf" %}
 # Note: upstream build breaks with old version of setuptools
 # ref: https://github.com/grpc/grpc/issues/34569
 RUN pip3 install grpcio==1.58.0 grpcio-tools==1.58.0
+{%- else %}
+# Also supplies sonic-py-common's fixed gNOI generator and runtime.
+RUN pip3 install grpcio==1.71.0 grpcio-tools==1.71.0 protobuf==5.29.6
+{%- if CROSS_BUILD_ENVIRON == "y" %}
+RUN PATH=/python_virtualenv/env3/bin/:$PATH pip3 install grpcio==1.71.0 grpcio-tools==1.71.0 protobuf==5.29.6
+{%- endif %}
+{%- endif %}
 
 # For running Python unit tests
 RUN pip3 install pytest-runner==5.2

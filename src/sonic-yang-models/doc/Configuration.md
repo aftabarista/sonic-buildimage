@@ -1099,6 +1099,7 @@ instance is supported in SONiC.
         "hwsku": "Force10-S6100",
         "default_bgp_status": "up",
         "docker_routing_config_mode": "unified",
+        "enable_per_port_counter_discovery": "false",
         "hostname": "sonic-s6100-01",
         "platform": "x86_64-dell_s6100_c2538-r0",
         "mac": "4c:76:25:f4:70:82",
@@ -1390,6 +1391,8 @@ The FG_NHG_PREFIX table provides the FG_NHG_PREFIX for which FG behavior is desi
 
 ### FLEX_COUNTER_TABLE
 
+`ICMP_SESSION` controls ICMP echo session counter polling. `POLL_INTERVAL` for `ICMP_SESSION` is in milliseconds with allowed range `1000..30000`.
+
 ```
 {
 	"FLEX_COUNTER_TABLE": {
@@ -1416,6 +1419,10 @@ The FG_NHG_PREFIX table provides the FG_NHG_PREFIX for which FG behavior is desi
 		"WRED_ECN_PORT": {
 			"FLEX_COUNTER_STATUS": "enable",
 			"POLL_INTERVAL": "1000"
+		},
+		"ICMP_SESSION": {
+			"FLEX_COUNTER_STATUS": "enable",
+			"POLL_INTERVAL": "10000"
 		},
 		"SWITCH": {
 			"FLEX_COUNTER_STATUS": "enable",
